@@ -1,10 +1,14 @@
 import hashlib
 import json
-from typing import Any
+from contextlib import contextmanager
+from datetime import datetime
+from typing import Any, Iterator
 
-import psycopg
-from psycopg import Connection
-from psycopg.rows import dict_row
+from sqlalchemy import BigInteger, Boolean, DateTime, ForeignKey, Index, Integer, Text
+from sqlalchemy import create_engine, func, select, text as sql_text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from app.schemas import (
     AuthUserResponse,
@@ -16,116 +20,243 @@ from app.schemas import (
 )
 
 
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    id BIGSERIAL PRIMARY KEY,
-    google_sub TEXT NOT NULL UNIQUE,
-    email TEXT NOT NULL,
-    name TEXT,
-    picture TEXT,
-    email_verified BOOLEAN NOT NULL DEFAULT FALSE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+def _normalize_database_url(url: str) -> str:
+    if url.startswith("postgresql+"):
+        return url
+    if url.startswith("postgresql://"):
+        return url.replace("postgresql://", "postgresql+psycopg://", 1)
+    if url.startswith("postgres://"):
+        return url.replace("postgres://", "postgresql+psycopg://", 1)
+    return url
 
-CREATE TABLE IF NOT EXISTS search_queries (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    broad_topic TEXT,
-    search_query TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE TABLE IF NOT EXISTS found_videos (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    search_query_id BIGINT REFERENCES search_queries(id) ON DELETE CASCADE,
-    video_id TEXT NOT NULL,
-    title TEXT,
-    channel_title TEXT,
-    published_at TEXT,
-    metadata_json TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+class Base(DeclarativeBase):
+    pass
 
-CREATE TABLE IF NOT EXISTS selected_videos (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    video_id TEXT NOT NULL,
-    title TEXT,
-    metadata_json TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE TABLE IF NOT EXISTS transcripts (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    video_id TEXT NOT NULL,
-    status TEXT NOT NULL,
-    error_reason TEXT,
-    text TEXT,
-    segments_json TEXT,
-    segments_count INTEGER NOT NULL DEFAULT 0,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+class User(Base):
+    __tablename__ = "users"
 
-CREATE TABLE IF NOT EXISTS suggested_topics (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    transcript_hash TEXT NOT NULL,
-    transcript_preview TEXT NOT NULL,
-    topic TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    google_sub: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    email: Mapped[str] = mapped_column(Text, nullable=False)
+    name: Mapped[str | None] = mapped_column(Text)
+    picture: Mapped[str | None] = mapped_column(Text)
+    email_verified: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
-CREATE TABLE IF NOT EXISTS selected_topics (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    transcript_hash TEXT NOT NULL,
-    transcript_preview TEXT NOT NULL,
-    topic TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
 
-CREATE TABLE IF NOT EXISTS generated_posts (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    selected_topic_id BIGINT REFERENCES selected_topics(id) ON DELETE CASCADE,
-    post_text TEXT NOT NULL,
-    position INTEGER NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+class SearchQuery(Base):
+    __tablename__ = "search_queries"
 
-CREATE TABLE IF NOT EXISTS action_history (
-    id BIGSERIAL PRIMARY KEY,
-    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-    action TEXT NOT NULL,
-    details_json TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    broad_topic: Mapped[str | None] = mapped_column(Text)
+    search_query: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
-CREATE INDEX IF NOT EXISTS idx_action_history_user_created
-ON action_history(user_id, created_at);
-"""
+
+class FoundVideo(Base):
+    __tablename__ = "found_videos"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    search_query_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("search_queries.id", ondelete="CASCADE"),
+    )
+    video_id: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    channel_title: Mapped[str | None] = mapped_column(Text)
+    published_at: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class SelectedVideo(Base):
+    __tablename__ = "selected_videos"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    video_id: Mapped[str] = mapped_column(Text, nullable=False)
+    title: Mapped[str | None] = mapped_column(Text)
+    metadata_json: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class Transcript(Base):
+    __tablename__ = "transcripts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    video_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    error_reason: Mapped[str | None] = mapped_column(Text)
+    text: Mapped[str | None] = mapped_column(Text)
+    segments_json: Mapped[str | None] = mapped_column(Text)
+    segments_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default="0",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class SuggestedTopic(Base):
+    __tablename__ = "suggested_topics"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    transcript_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    transcript_preview: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class SelectedTopic(Base):
+    __tablename__ = "selected_topics"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    transcript_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    transcript_preview: Mapped[str] = mapped_column(Text, nullable=False)
+    topic: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class GeneratedPost(Base):
+    __tablename__ = "generated_posts"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    selected_topic_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("selected_topics.id", ondelete="CASCADE"),
+    )
+    post_text: Mapped[str] = mapped_column(Text, nullable=False)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
+
+
+class ActionHistory(Base):
+    __tablename__ = "action_history"
+    __table_args__ = (
+        Index("idx_action_history_user_created", "user_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int | None] = mapped_column(
+        BigInteger,
+        ForeignKey("users.id", ondelete="CASCADE"),
+    )
+    action: Mapped[str] = mapped_column(Text, nullable=False)
+    details_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+    )
 
 
 class Database:
     def __init__(self, url: str) -> None:
         self.url = url
-
-    def connect(self) -> Connection:
-        return psycopg.connect(self.url, row_factory=dict_row)
+        self.engine = create_engine(_normalize_database_url(url), future=True)
+        self.session_factory = sessionmaker(
+            bind=self.engine,
+            autoflush=False,
+            expire_on_commit=False,
+        )
 
     def init(self) -> None:
-        with self.connect() as connection:
-            for statement in SCHEMA_SQL.split(";"):
-                if statement.strip():
-                    connection.execute(statement)
-            self._ensure_schema_columns(connection)
+        Base.metadata.create_all(self.engine)
+        self._ensure_schema_columns(self.engine)
 
-    def _ensure_schema_columns(self, connection: Connection) -> None:
-        connection.execute("ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS segments_json TEXT")
+    @contextmanager
+    def session(self) -> Iterator[Session]:
+        with self.session_factory() as session:
+            yield session
+
+    @contextmanager
+    def transaction(self) -> Iterator[Session]:
+        with self.session_factory() as session:
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    def _ensure_schema_columns(self, engine: Engine) -> None:
+        with engine.begin() as connection:
+            connection.execute(
+                sql_text("ALTER TABLE transcripts ADD COLUMN IF NOT EXISTS segments_json TEXT")
+            )
 
 
 class DatabaseRepository:
@@ -133,28 +264,26 @@ class DatabaseRepository:
         self.database = database
 
     def upsert_user(self, user: AuthUserResponse) -> int:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                INSERT INTO users (google_sub, email, name, picture, email_verified)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (google_sub) DO UPDATE SET
-                    email = EXCLUDED.email,
-                    name = EXCLUDED.name,
-                    picture = EXCLUDED.picture,
-                    email_verified = EXCLUDED.email_verified,
-                    updated_at = CURRENT_TIMESTAMP
-                RETURNING id
-                """,
-                (
-                    user.google_sub,
-                    user.email,
-                    user.name,
-                    user.picture,
-                    user.email_verified,
-                ),
-            ).fetchone()
-            return int(row["id"])
+        with self.database.transaction() as session:
+            statement = pg_insert(User).values(
+                google_sub=user.google_sub,
+                email=user.email,
+                name=user.name,
+                picture=user.picture,
+                email_verified=user.email_verified,
+            )
+            statement = statement.on_conflict_do_update(
+                index_elements=[User.google_sub],
+                set_={
+                    "email": statement.excluded.email,
+                    "name": statement.excluded.name,
+                    "picture": statement.excluded.picture,
+                    "email_verified": statement.excluded.email_verified,
+                    "updated_at": func.now(),
+                },
+            ).returning(User.id)
+            user_id = session.execute(statement).scalar_one()
+            return int(user_id)
 
     def create_search_query(
         self,
@@ -162,18 +291,16 @@ class DatabaseRepository:
         search_query: str,
         broad_topic: str | None = None,
     ) -> int:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                INSERT INTO search_queries (user_id, broad_topic, search_query)
-                VALUES (%s, %s, %s)
-                RETURNING id
-                """,
-                (user_id, broad_topic, search_query),
-            ).fetchone()
-            search_query_id = int(row["id"])
+        with self.database.transaction() as session:
+            row = SearchQuery(
+                user_id=user_id,
+                broad_topic=broad_topic,
+                search_query=search_query,
+            )
+            session.add(row)
+            session.flush()
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "search_query_created",
                 {
@@ -181,7 +308,7 @@ class DatabaseRepository:
                     "broadTopic": broad_topic,
                 },
             )
-            return search_query_id
+            return int(row.id)
 
     def add_found_videos(
         self,
@@ -189,33 +316,21 @@ class DatabaseRepository:
         search_query_id: int,
         videos: list[VideoResponse],
     ) -> None:
-        with self.database.connect() as connection:
+        with self.database.transaction() as session:
             for position, video in enumerate(videos, start=1):
-                connection.execute(
-                    """
-                    INSERT INTO found_videos (
-                        user_id,
-                        search_query_id,
-                        video_id,
-                        title,
-                        channel_title,
-                        published_at,
-                        metadata_json
+                session.add(
+                    FoundVideo(
+                        user_id=user_id,
+                        search_query_id=search_query_id,
+                        video_id=video.video_id,
+                        title=video.title,
+                        channel_title=video.channel_title,
+                        published_at=video.published_at,
+                        metadata_json=self._to_json(video.model_dump(by_alias=True)),
                     )
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
-                    """,
-                    (
-                        user_id,
-                        search_query_id,
-                        video.video_id,
-                        video.title,
-                        video.channel_title,
-                        video.published_at,
-                        self._to_json(video.model_dump(by_alias=True)),
-                    ),
                 )
                 self._log_action(
-                    connection,
+                    session,
                     user_id,
                     "video_found",
                     {
@@ -226,21 +341,17 @@ class DatabaseRepository:
                 )
 
     def save_selected_video(self, user_id: int | None, video: VideoResponse) -> None:
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO selected_videos (user_id, video_id, title, metadata_json)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (
-                    user_id,
-                    video.video_id,
-                    video.title,
-                    self._to_json(video.model_dump(by_alias=True)),
-                ),
+        with self.database.transaction() as session:
+            session.add(
+                SelectedVideo(
+                    user_id=user_id,
+                    video_id=video.video_id,
+                    title=video.title,
+                    metadata_json=self._to_json(video.model_dump(by_alias=True)),
+                )
             )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "video_selected",
                 {
@@ -257,30 +368,19 @@ class DatabaseRepository:
         segments_json = self._to_json(
             [segment.model_dump() for segment in transcript.segments]
         )
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO transcripts (
-                    user_id,
-                    video_id,
-                    status,
-                    text,
-                    segments_json,
-                    segments_count
+        with self.database.transaction() as session:
+            session.add(
+                Transcript(
+                    user_id=user_id,
+                    video_id=transcript.video_id,
+                    status="success",
+                    text=transcript.text,
+                    segments_json=segments_json,
+                    segments_count=transcript.segments_count,
                 )
-                VALUES (%s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    user_id,
-                    transcript.video_id,
-                    "success",
-                    transcript.text,
-                    segments_json,
-                    transcript.segments_count,
-                ),
             )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "transcript_fetched",
                 {
@@ -294,31 +394,33 @@ class DatabaseRepository:
         user_id: int,
         video_id: str,
     ) -> TranscriptResponse | None:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT text, segments_json, segments_count
-                FROM transcripts
-                WHERE user_id = %s
-                    AND video_id = %s
-                    AND status = 'success'
-                    AND text IS NOT NULL
-                ORDER BY id DESC
-                LIMIT 1
-                """,
-                (user_id, video_id),
-            ).fetchone()
+        with self.database.session() as session:
+            row = session.execute(
+                select(
+                    Transcript.text,
+                    Transcript.segments_json,
+                    Transcript.segments_count,
+                )
+                .where(
+                    Transcript.user_id == user_id,
+                    Transcript.video_id == video_id,
+                    Transcript.status == "success",
+                    Transcript.text.is_not(None),
+                )
+                .order_by(Transcript.id.desc())
+                .limit(1)
+            ).first()
 
         if not row:
             return None
 
-        text = str(row["text"])
-        segments = self._transcript_segments_from_json(row["segments_json"])
+        text = str(row.text)
+        segments = self._transcript_segments_from_json(row.segments_json)
         return TranscriptResponse(
             video_id=video_id,
             text=text,
             segments=segments,
-            segments_count=int(row["segments_count"]),
+            segments_count=int(row.segments_count),
         )
 
     def save_transcript_error(
@@ -327,16 +429,17 @@ class DatabaseRepository:
         video_id: str,
         error_reason: str,
     ) -> None:
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO transcripts (user_id, video_id, status, error_reason)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (user_id, video_id, "error", error_reason),
+        with self.database.transaction() as session:
+            session.add(
+                Transcript(
+                    user_id=user_id,
+                    video_id=video_id,
+                    status="error",
+                    error_reason=error_reason,
+                )
             )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "transcript_failed",
                 {
@@ -353,23 +456,19 @@ class DatabaseRepository:
     ) -> None:
         transcript_hash = self._hash_text(transcript)
         transcript_preview = transcript[:300]
-        with self.database.connect() as connection:
+        with self.database.transaction() as session:
             for position, topic in enumerate(response.topics, start=1):
-                connection.execute(
-                    """
-                    INSERT INTO suggested_topics (
-                        user_id,
-                        transcript_hash,
-                        transcript_preview,
-                        topic,
-                        position
+                session.add(
+                    SuggestedTopic(
+                        user_id=user_id,
+                        transcript_hash=transcript_hash,
+                        transcript_preview=transcript_preview,
+                        topic=topic,
+                        position=position,
                     )
-                    VALUES (%s, %s, %s, %s, %s)
-                    """,
-                    (user_id, transcript_hash, transcript_preview, topic, position),
                 )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "topics_suggested",
                 {
@@ -387,29 +486,25 @@ class DatabaseRepository:
     ) -> None:
         transcript_hash = self._hash_text(transcript)
         transcript_preview = transcript[:300]
-        with self.database.connect() as connection:
+        with self.database.transaction() as session:
             selected_topic_id = self._get_or_create_selected_topic(
-                connection=connection,
+                session=session,
                 user_id=user_id,
                 transcript_hash=transcript_hash,
                 transcript_preview=transcript_preview,
                 selected_topic=selected_topic,
             )
             for position, post in enumerate(response.posts, start=1):
-                connection.execute(
-                    """
-                    INSERT INTO generated_posts (
-                        user_id,
-                        selected_topic_id,
-                        post_text,
-                        position
+                session.add(
+                    GeneratedPost(
+                        user_id=user_id,
+                        selected_topic_id=selected_topic_id,
+                        post_text=post,
+                        position=position,
                     )
-                    VALUES (%s, %s, %s, %s)
-                    """,
-                    (user_id, selected_topic_id, post, position),
                 )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "posts_generated",
                 {
@@ -427,16 +522,16 @@ class DatabaseRepository:
     ) -> int:
         transcript_hash = self._hash_text(transcript)
         transcript_preview = transcript[:300]
-        with self.database.connect() as connection:
+        with self.database.transaction() as session:
             selected_topic_id = self._get_or_create_selected_topic(
-                connection=connection,
+                session=session,
                 user_id=user_id,
                 transcript_hash=transcript_hash,
                 transcript_preview=transcript_preview,
                 selected_topic=selected_topic,
             )
             self._log_action(
-                connection,
+                session,
                 user_id,
                 "topic_selected",
                 {
@@ -448,78 +543,77 @@ class DatabaseRepository:
             return selected_topic_id
 
     def list_user_history(self, user_id: int, limit: int = 20) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
-            rows = connection.execute(
-                """
-                SELECT action, details_json, created_at::text AS created_at
-                FROM action_history
-                WHERE user_id = %s
-                ORDER BY id DESC
-                LIMIT %s
-                """,
-                (user_id, limit),
-            ).fetchall()
+        with self.database.session() as session:
+            rows = session.execute(
+                select(
+                    ActionHistory.action,
+                    ActionHistory.details_json,
+                    ActionHistory.created_at,
+                )
+                .where(ActionHistory.user_id == user_id)
+                .order_by(ActionHistory.id.desc())
+                .limit(limit)
+            ).all()
+
         return [
             {
-                "action": row["action"],
-                "details": json.loads(row["details_json"]),
-                "createdAt": row["created_at"],
+                "action": row.action,
+                "details": json.loads(row.details_json),
+                "createdAt": str(row.created_at),
             }
             for row in rows
         ]
 
     def _log_action(
         self,
-        connection: Connection,
+        session: Session,
         user_id: int | None,
         action: str,
         details: dict[str, Any],
     ) -> None:
-        connection.execute(
-            """
-            INSERT INTO action_history (user_id, action, details_json)
-            VALUES (%s, %s, %s)
-            """,
-            (user_id, action, self._to_json(details)),
+        session.add(
+            ActionHistory(
+                user_id=user_id,
+                action=action,
+                details_json=self._to_json(details),
+            )
         )
 
     def _get_or_create_selected_topic(
         self,
-        connection: Connection,
+        session: Session,
         user_id: int | None,
         transcript_hash: str,
         transcript_preview: str,
         selected_topic: str,
     ) -> int:
-        row = connection.execute(
-            """
-            SELECT id
-            FROM selected_topics
-            WHERE user_id IS NOT DISTINCT FROM %s
-                AND transcript_hash = %s
-                AND topic = %s
-            ORDER BY id DESC
-            LIMIT 1
-            """,
-            (user_id, transcript_hash, selected_topic),
-        ).fetchone()
-        if row:
-            return int(row["id"])
-
-        row = connection.execute(
-            """
-            INSERT INTO selected_topics (
-                user_id,
-                transcript_hash,
-                transcript_preview,
-                topic
+        user_filter = (
+            SelectedTopic.user_id.is_(None)
+            if user_id is None
+            else SelectedTopic.user_id == user_id
+        )
+        row = session.execute(
+            select(SelectedTopic)
+            .where(
+                user_filter,
+                SelectedTopic.transcript_hash == transcript_hash,
+                SelectedTopic.topic == selected_topic,
             )
-            VALUES (%s, %s, %s, %s)
-            RETURNING id
-            """,
-            (user_id, transcript_hash, transcript_preview, selected_topic),
-        ).fetchone()
-        return int(row["id"])
+            .order_by(SelectedTopic.id.desc())
+            .limit(1)
+        ).scalar_one_or_none()
+        if row:
+            return int(row.id)
+
+        row = SelectedTopic(
+            user_id=user_id,
+            transcript_hash=transcript_hash,
+            transcript_preview=transcript_preview,
+            topic=selected_topic,
+        )
+        session.add(row)
+        session.flush()
+        return int(row.id)
 
     def _hash_text(self, text: str) -> str:
         return hashlib.sha256(text.encode("utf-8")).hexdigest()

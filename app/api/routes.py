@@ -1,4 +1,5 @@
 import secrets
+from functools import lru_cache
 
 from fastapi import APIRouter, Request
 from fastapi.responses import RedirectResponse
@@ -49,6 +50,7 @@ def get_ai_service() -> AIService:
     )
 
 
+@lru_cache
 def get_database_repository() -> DatabaseRepository:
     settings = get_settings()
     return DatabaseRepository(Database(settings.require_database_url()))

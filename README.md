@@ -16,7 +16,7 @@ Implemented:
 - Google OAuth login.
 - Signed cookie session.
 - Simple account page.
-- PostgreSQL storage.
+- PostgreSQL storage through SQLAlchemy.
 - User action history in the account page.
 - Auth-required workflow endpoints.
 - Per-user transcript cache.
